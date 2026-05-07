@@ -9,6 +9,7 @@ import {
   costEvents,
   createDb,
   executionWorkspaces,
+  goals,
   heartbeatRuns,
   issueComments,
   issueRelations,
@@ -421,6 +422,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     const managerId = randomUUID();
     const blockedIssueId = randomUUID();
     const blockerIssueId = randomUUID();
+    const blockerGoalId = randomUUID();
     const dependentProjectId = randomUUID();
     const blockerProjectId = randomUUID();
     const dependentProjectWorkspaceId = randomUUID();
@@ -435,6 +437,13 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       name: "Paperclip",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(goals).values({
+      id: blockerGoalId,
+      companyId,
+      title: "Blocker goal",
+      level: "task",
+      status: "active",
     });
     await db.insert(agents).values({
       id: managerId,
@@ -457,6 +466,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       {
         id: blockerProjectId,
         companyId,
+        goalId: blockerGoalId,
         name: "Blocker workspace project",
         status: "in_progress",
       },
@@ -520,6 +530,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         id: blockerIssueId,
         companyId,
         projectId: blockerProjectId,
+        goalId: blockerGoalId,
         projectWorkspaceId: blockerProjectWorkspaceId,
         executionWorkspaceId: blockerExecutionWorkspaceId,
         executionWorkspacePreference: "reuse_existing",
@@ -551,10 +562,29 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     expect(escalations[0]).toMatchObject({
       parentId: blockerIssueId,
       projectId: blockerProjectId,
+      goalId: blockerGoalId,
       projectWorkspaceId: blockerProjectWorkspaceId,
       executionWorkspaceId: null,
       executionWorkspacePreference: null,
       assigneeAgentId: managerId,
+    });
+  });
+
+  it("keeps projectId/goalId null on liveness escalations when the leaf blocker has null linkage", async () => {
+    await enableAutoRecovery();
+    const { companyId } = await seedBlockedChain();
+
+    const result = await heartbeatService(db).reconcileIssueGraphLiveness();
+    expect(result.escalationsCreated).toBe(1);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toMatchObject({
+      projectId: null,
+      goalId: null,
     });
   });
 

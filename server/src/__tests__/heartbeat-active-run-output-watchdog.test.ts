@@ -5,10 +5,12 @@ import {
   agents,
   companies,
   createDb,
+  goals,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
   issueRelations,
   issues,
+  projects,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -94,7 +96,16 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedRunningRun(opts: { now: Date; ageMs: number; withOutput?: boolean; logChunk?: string }) {
+  async function seedRunningRun(
+    opts: {
+      now: Date;
+      ageMs: number;
+      withOutput?: boolean;
+      logChunk?: string;
+      sourceProjectId?: string | null;
+      sourceGoalId?: string | null;
+    },
+  ) {
     const companyId = randomUUID();
     const managerId = randomUUID();
     const coderId = randomUUID();
@@ -135,9 +146,29 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
         permissions: {},
       },
     ]);
+    if (opts.sourceGoalId) {
+      await db.insert(goals).values({
+        id: opts.sourceGoalId,
+        companyId,
+        title: "Watchdog source goal",
+        level: "task",
+        status: "active",
+      });
+    }
+    if (opts.sourceProjectId) {
+      await db.insert(projects).values({
+        id: opts.sourceProjectId,
+        companyId,
+        goalId: opts.sourceGoalId ?? null,
+        name: "Watchdog source project",
+        status: "in_progress",
+      });
+    }
     await db.insert(issues).values({
       id: issueId,
       companyId,
+      projectId: opts.sourceProjectId ?? null,
+      goalId: opts.sourceGoalId ?? null,
       title: "Long running implementation",
       status: "in_progress",
       priority: "medium",
@@ -268,6 +299,54 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
     const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(source?.status).toBe("blocked");
+  });
+
+  it("inherits projectId/goalId from source issue for stale-run evaluations and preserves nulls", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const sourceProjectId = randomUUID();
+    const sourceGoalId = randomUUID();
+
+    const inherited = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      sourceProjectId,
+      sourceGoalId,
+    });
+    const nullSource = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+      sourceProjectId: null,
+      sourceGoalId: null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const inheritedResult = await heartbeat.scanSilentActiveRuns({ now, companyId: inherited.companyId });
+    const nullResult = await heartbeat.scanSilentActiveRuns({ now, companyId: nullSource.companyId });
+
+    const inheritedEvaluationId = inheritedResult.evaluationIssueIds[0];
+    const nullEvaluationId = nullResult.evaluationIssueIds[0];
+    expect(inheritedEvaluationId).toBeTruthy();
+    expect(nullEvaluationId).toBeTruthy();
+
+    const inheritedEvaluation = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, inheritedEvaluationId!))
+      .then((rows) => rows[0] ?? null);
+    const nullEvaluation = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, nullEvaluationId!))
+      .then((rows) => rows[0] ?? null);
+
+    expect(inheritedEvaluation).toMatchObject({
+      projectId: sourceProjectId,
+      goalId: sourceGoalId,
+    });
+    expect(nullEvaluation).toMatchObject({
+      projectId: null,
+      goalId: null,
+    });
   });
 
   it("skips snoozed runs and healthy noisy runs", async () => {
